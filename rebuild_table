@@ -1,0 +1,128 @@
+#####################
+#log_path=/home/oracle/test_log
+#cat /dev/null> ${log_path}
+
+
+USR_ORA_HOME=/home/oracle
+ENV=$1
+EXEC_LOG=/tmp/exec_rebuild_table.log
+MAIL_LIST="6687145@icchance.com.tw,6687125@icchance.com.tw"
+START_TIME=$(date "+%Y-%m-%d %H:%M:%S")
+#####################
+DEGREE=4
+TABPCTFREEVAL=40
+IDXPCTFREEVAL=40
+#####################
+
+export ORACLE_HOME=/usr/u01/oracle/db1
+export PATH=$ORACLE_HOME/bin:$PATH
+export ORACLE_SID=FANORCL1
+
+FRAGMENTED=`sqlplus -s /nolog <<EOF
+connect / as sysdba
+set feedback off pagesize 0
+set trimspool on
+set heading on
+set echo on
+select "OWNER"||','||"TABLE_NAME"||','||"NUM_ROWS" ITEM
+from (select owner,table_name,num_rows,to_char(last_analyzed, 'yyyy-mm-dd_hh24:mi:ss') last_analyzed,
+round(blocks * 8192/1024/1024)     "FULL_SIZE_MB",
+round(num_rows * avg_row_len/1024/1024)  "ACTUAL_SIZE_MB",
+round(blocks * 8192/1024/1024) - round(num_rows * avg_row_len/1024/1024) "FRAGMENTED_SPACE_MB",
+round(((round((blocks * 8192/1024/1024)) - round((num_rows * avg_row_len/1024/1024))) / round((blocks * 8192/1024/1024))) * 100)||'%' "%FRAGMENTED_SPACE"
+from dba_tables
+where
+owner <> 'SYS'
+and blocks>10
+and round(blocks * 8192/1024/1024) > 10
+-- List only the tables with Fragmented Space > 30%:
+and ((round((blocks * 8192/1024/1024)) - round((num_rows * avg_row_len/1024/1024))) / round((blocks * 8192/1024/1024))) * 100 > 30
+-- and round(blocks * 8192/1024/1024) - round(num_rows * avg_row_len/1024/1024) >1024
+order by "FRAGMENTED_SPACE_MB" desc)
+where table_name not like 'BACKUP%'
+and (owner,table_name) in
+(
+    select a.owner,a.segment_name from 
+    (
+        select t.*,row_number()over(partition by owner,segment_name order by total_buff_busy_waits desc) ranknum from 
+        (         
+            select owner,object_name as segment_name,object_type,value as total_buff_busy_waits
+                     from v\\$segment_statistics
+                     where statistic_name in ('buffer busy waits')
+                     and object_type ='TABLE'
+                     and owner like 'REBATE%'
+            union all
+            select a.owner,b.table_name as segment_name,a.object_type,a.value as total_buff_busy_waits
+                     from v\\$segment_statistics a join dba_indexes b on a.object_name =b.index_name and a.owner = b.owner
+                     where a.statistic_name in ('buffer busy waits')
+                     and a.object_type ='INDEX'  
+                     and a.owner like 'REBATE%'
+        ) t
+        order by total_buff_busy_waits desc
+    )  a
+    where ranknum = 1
+    and  rownum < 11
+);
+exit;
+EOF`
+
+echo ${FRAGMENTED}
+
+for I in ${FRAGMENTED}
+do
+
+ START_TIME=$(date "+%Y-%m-%d_%H:%M:%S")
+
+ OWNER="$(cut -d, -f1 <<<${I})"
+ OBJECT_NAME="$(cut -d, -f2 <<<${I})"
+ NUM_ROWS="$(cut -d, -f3 <<<${I})"
+ 
+ #echo ${OWNER}
+ #echo ${OBJECT_NAME}
+ #echo ${LAST_ANALYZED}
+ #echo ${FULL_SIZE_MB}
+ #echo ${ACTUAL_SIZE_MB}
+ #echo ${FRAGMENTED_SPACE_MB}
+ #echo ${FRAGMENTED_SPACE}
+ #echo " "
+ 
+ #呼叫shell，並代入參數
+ #. test_input.sh ${OWNER} ${TABLE_NAME} "test01" >> ${log_path}
+/home/oracle/dba_rebuild_table_job/rebuild_table.sh ${OWNER} ${OBJECT_NAME} ${DEGREE} ${TABPCTFREEVAL} ${IDXPCTFREEVAL} ${ORACLE_SID} > ${EXEC_LOG} 2>&1
+ #echo " "
+ 
+  END_TIME=$(date "+%Y-%m-%d_%H:%M:%S")
+ 
+ MAIL_CONTENT="OWNER: ${OWNER}
+TABLE_NAME: ${OBJECT_NAME}
+NUM_ROWS: ${NUM_ROWS}
+START_EXEC_TIME: ${START_TIME}
+END_EXEC_TIME: ${END_TIME}"
+
+ 
+ TERMINAL=`cat ${EXEC_LOG} | grep -c -e "SCRIPT TERMINATED" -e "ORA-"`
+ 
+ if [ "${TERMINAL}" -gt 0 ]
+ then 
+	 echo "${MAIL_CONTENT}"|mailx   -s "[${ENV}] ${OWNER}.${OBJECT_NAME} rebuild failed." -a ${EXEC_LOG} ${MAIL_LIST} 
+ else
+	 echo "${MAIL_CONTENT}"|mailx   -s "[${ENV}] ${OWNER}.${OBJECT_NAME} rebuild has been completed." -a ${USR_ORA_HOME}/REBUILDTABLESCRIPT-${OWNER}.${OBJECT_NAME}.sql -a ${USR_ORA_HOME}/REBUILDINDEXSCRIPT-${OWNER}.${OBJECT_NAME}.sql -a ${USR_ORA_HOME}/REBUILDTABLESCRIPT-${OWNER}.${OBJECT_NAME}.sh -a ${USR_ORA_HOME}/REBUILDTABLESCRIPT-${OWNER}.${OBJECT_NAME}.log -a ${USR_ORA_HOME}/REBUILDINDEXSCRIPT-${OWNER}.${OBJECT_NAME}.log ${MAIL_LIST}
+ fi
+ 
+ sqlplus -s /nolog <<EOF
+connect / as sysdba
+insert into sys.DBA_REBUILD_TABLE_LOG values ('${OWNER}','${OBJECT_NAME}','${START_TIME}','${END_TIME}');
+COMMIT;
+exit;
+EOF
+
+ sleep 5
+
+done
+
+#動作完成發信
+ if [ ! -n "${FRAGMENTED}" ]
+ then
+	 echo "No need to rebuild." | mailx  -s "[${ENV}] No need to rebuild." ${MAIL_LIST}
+ fi 
+
